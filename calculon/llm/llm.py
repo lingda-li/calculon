@@ -362,6 +362,7 @@ class Llm:
     self._weight_grad_space = None
     self._act_grad_space = None
     self._optimizer_space = None
+    self._kvcache_space = None
 
     # Top level throughput stats
     self._fw_flops = None
@@ -1909,6 +1910,9 @@ class Llm:
       self._act_space = self._block_act_working_space
       self._act_checkpoint_size = 0
       self._act_grad_space = 0
+      self._kvcache_space = self._bytes_per_element * self.app.attn_size * \
+        self.app.attn_heads // self.exe.tensor_par * 1024 * \
+        self.exe._local_batch_size * 2 * self._blocks_per_proc
 
     # Optimizer split  already accounted for during block compilation
     # We should keep non-sharded weight grad for a current block for AllReduce
@@ -2238,6 +2242,9 @@ class Llm:
     else:
       return 0
 
+  def get_kvcache_space(self):
+    return self._kvcache_space
+
   def _get_mem_cap_reqs(self):
     tier1 = 0
     tier2 = 0
@@ -2352,6 +2359,7 @@ class Llm:
       f"Act grad: {human_format(self.get_act_grad_space(), 'bytes')};\n" \
       f"Weight grad: {human_format(self.get_weight_grad_space(), 'bytes')};\n" \
       f"Optim space: {human_format(self.get_optimizer_space(), 'bytes')};\n" \
+      f"KV Cache: {human_format(self.get_kvcache_space(), 'bytes')};\n" \
       f"Batch FW time: {self.get_fw_time():.4f};\n" \
       f"Batch BW time: {self.get_bw_time():.4f};\n" \
       f"Batch optim time: {self.get_optim_step_time():.4f};\n" \
