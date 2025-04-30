@@ -62,10 +62,14 @@ class Llm:
         'datatype', 'fused_activation', 'attention_type', 'activation_recompute',
         'pipeline_interleaving', 'optimizer_sharding', 'tensor_par_comm_type',
         'tensor_par_overlap', 'seq_par_ag_redo', 'data_par_overlap',
-        'weight_offload', 'activations_offload', 'optimizer_offload', 'training')
+        'weight_offload', 'activations_offload', 'optimizer_offload', 'training',
+        'autoregression', 'prefill_size')
 
     @staticmethod
     def from_json(cfg):
+      if 'autoregression' not in cfg:
+        cfg['autoregression'] = False
+        cfg['prefill_size'] = 0
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
@@ -77,7 +81,8 @@ class Llm:
                  pipeline_interleaving, optimizer_sharding,
                  tensor_par_comm_type, tensor_par_overlap,
                  seq_par_ag_redo, data_par_overlap, weight_offload,
-                 activations_offload, optimizer_offload, training):
+                 activations_offload, optimizer_offload, training,
+                 autoregression, prefill_size):
       self.training = training
       self.num_procs = num_procs
       assert self.num_procs > 0
@@ -143,6 +148,11 @@ class Llm:
       if self.optimizer_offload:
         assert self.training, \
           "We only perform optimizer offloading during training"
+      self.autoregression = autoregression
+      if self.autoregression:
+        assert not self.training, \
+          "Autoregression modeling is only for inference"
+      self.prefill_size = prefill_size
 
     def get_json(self):
       keys = Llm.Execution.fields()
@@ -152,7 +162,8 @@ class Llm:
         self.datatype, self.fused_activation, self.attention_type, self.activation_recompute,
         self.pipeline_interleaving, self.optimizer_sharding, self.tensor_par_comm_type,
         self.tensor_par_overlap, self.seq_par_ag_redo, self.data_par_overlap,
-        self.weight_offload, self.activations_offload, self.optimizer_offload, self.training
+        self.weight_offload, self.activations_offload, self.optimizer_offload, self.training,
+        self.autoregression, self.prefill_size
       ]
       assert len(keys) == len(values)
       return dict(zip(keys, values))
@@ -812,27 +823,31 @@ class Llm:
           activation_reused=True))
       else:
         raise self.Error('Wrong attention type', self.exe.attention_type)
+    if self.exe.autoregression:
+      prefill_seq_size = self.exe.prefill_size
+    else:
+      prefill_seq_size = self.app.seq_size
     self._llm_block.append(BatchMatMul(
       "AttnBlock_Multihead_Key_Query",
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
       self.app.seq_size,
       self.app.attn_size,
-      self.app.seq_size,
+      prefill_seq_size,
       needs_recompute=recompute_attn_flag,
       output_stored=(not recompute_attn_flag)))
     self._llm_block.append(SoftMax(
       "AttnBlock_Multihead_SoftMax",
       self.sys,
       self.app.attn_heads // self.exe.tensor_par * \
-        self.app.seq_size**2 * self.exe.microbatch_size,
+        self.app.seq_size * prefill_seq_size * self.exe.microbatch_size,
       needs_recompute=recompute_attn_flag,
       output_stored=(not recompute_attn_flag)))
     self._llm_block.append(DropOut(
       "AttnBlock_Multihead_DropOut",
       self.sys,
       self.app.attn_heads // self.exe.tensor_par * \
-        self.app.seq_size**2 * self.exe.microbatch_size,
+        self.app.seq_size * prefill_seq_size * self.exe.microbatch_size,
       needs_recompute=recompute_attn_flag,
       activation_stored=(not recompute_attn_flag)))
     self._llm_block.append(BatchMatMul(
@@ -840,7 +855,7 @@ class Llm:
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
       self.app.seq_size,
-      self.app.seq_size,
+      prefill_seq_size,
       self.app.attn_heads * self.app.attn_size // self.app.attn_heads,
       needs_recompute=recompute_flag))
     if self.exe.tensor_par_overlap == 'none':
@@ -1029,6 +1044,9 @@ class Llm:
     assert not self._compiled
     assert isinstance(exe, self.Execution)
     self.exe = exe
+    if self.exe.autoregression:
+      assert self.app.seq_size == 1, \
+        "Autoregression supposes the sequence length is 1"
     assert isinstance(sys, System)
     self.sys = sys
     self._check_network_assignments()
@@ -1910,9 +1928,16 @@ class Llm:
       self._act_space = self._block_act_working_space
       self._act_checkpoint_size = 0
       self._act_grad_space = 0
-      self._kvcache_space = self._bytes_per_element * self.app.attn_size * \
-        self.app.attn_heads // self.exe.tensor_par * 1024 * \
+    if self.exe.autoregression:
+      self._kvcache_space = self._bytes_per_element * self.exe.prefill_size * \
         self.exe._local_batch_size * 2 * self._blocks_per_proc
+      if self.exe.attention_type == 'multihead':
+        self._kvcache_space *= self.app.attn_size * self.app.attn_heads // \
+          self.exe.tensor_par
+      elif self.exe.attention_type == 'multiquery':
+        self._kvcache_space *= self.app.attn_size
+    else:
+      self._kvcache_space = 0
 
     # Optimizer split  already accounted for during block compilation
     # We should keep non-sharded weight grad for a current block for AllReduce
