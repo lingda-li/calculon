@@ -1,6 +1,11 @@
 [![DOI](https://zenodo.org/badge/660734586.svg)](https://zenodo.org/badge/latestdoi/660734586)
 # Calculon - Co-design for large scale parallel applications
 
+## Difference with the original version
+
+1. Support mixture of experts.
+2. Support autoregressive token generation modeling.
+
 ## Running
 
 Run Calculon like this:

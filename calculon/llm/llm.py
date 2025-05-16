@@ -979,7 +979,7 @@ class Llm:
       expert_factor = self.app.num_shared_experts + \
         (self._experts_per_proc - self.app.num_shared_experts) * \
         self.app.num_top_experts / self.app.num_routed_experts
-      print("kk", expert_factor)
+      #print("", expert_factor)
     else:
       expert_factor = 1
 
@@ -2473,6 +2473,9 @@ class Llm:
   def get_sample_rate(self):
     return self.exe.global_batch_size / self.get_total_time()
 
+  def get_token_rate(self):
+    return self.exe.global_batch_size * self.app.seq_size / self.get_total_time()
+
   def display_stats(self):
     stats = "=" * 80 + "\n"
     stats += "" \
@@ -2482,6 +2485,7 @@ class Llm:
       f"num attn heads: {self.app.attn_heads}, " \
       f"attn_size={self.app.attn_size}\n" \
       f"Run on {self.exe.num_procs} processors with:\n" \
+      f"EP={self.exe.expert_par}\n" \
       f"TP={self.exe.tensor_par}\n" \
       f"PP={self.exe.pipeline_par}\n" \
       f"DP={self.exe.data_par}\n" \
@@ -2528,5 +2532,6 @@ class Llm:
       f"Compute efficiency: {self.get_compute_efficiency()*100:.2f}%;\n" \
       f"System efficiency: {self.get_system_efficiency()*100:.2f}%;\n" \
       f"Total efficiency: {self.get_total_efficiency()*100:.2f}%;\n" \
-      f"Sample rate: {self.get_sample_rate():.2f};\n"
+      f"Sample rate: {self.get_sample_rate():.2f};\n" \
+      f"Token rate: {self.get_token_rate():.2f};\n"
     self.log.info(stats)
