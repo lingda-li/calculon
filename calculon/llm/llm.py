@@ -2510,6 +2510,7 @@ class Llm:
       f"Batch TP comm overhead: {self.get_tp_comm_exposed_time():.4f};\n" \
       f"Batch PP comm overhead: {self.get_pp_comm_exposed_time():.4f};\n" \
       f"Batch DP comm overhead: {self.get_dp_comm_exposed_time():.4f};\n" \
+      f"Batch EP comm overhead: {self.get_ep_comm_exposed_time():.4f};\n" \
       f"Batch TP comm time on link: {self.get_tp_comm_link_time():.4f};\n" \
       f"Batch PP comm time on link: {self.get_pp_comm_link_time():.4f};\n" \
       f"Batch DP comm time on link: {self.get_dp_comm_link_time():.4f};\n" \
