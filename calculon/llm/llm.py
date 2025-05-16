@@ -38,6 +38,13 @@ class Llm:
       self.attn_heads = cfg['attn_heads']
       self.attn_size = cfg['attn_size']
       self.num_blocks = cfg['num_blocks']
+      self.num_experts = cfg.get('num_experts', 1)
+      self.num_top_experts = cfg.get('num_top_experts', 1)
+      self.num_shared_experts = cfg.get('num_shared_experts', 0)
+      self.num_activated_experts = self.num_top_experts + self.num_shared_experts
+      self.num_routed_experts = self.num_experts - self.num_shared_experts
+      assert self.num_top_experts < self.num_routed_experts, \
+        'the number of selected experts should be less than that of routed experts'
 
     def num_parameters(self):
       # https://cs.stanford.edu/~matei/papers/2021/sc_megatron_lm.pdf
@@ -47,6 +54,11 @@ class Llm:
       p += self.hidden + self.feedforward                      # biases MLP
       p += 3 * self.attn_heads * self.attn_size + self.hidden  # biases Attn
       p += 2 * 2 * self.hidden                                 # layer norm
+      if self.num_experts > 1:
+        # Gating network: hidden × num_routed_experts
+        p += self.hidden * self.num_routed_experts
+        # Expert MLP weights
+        p += (self.num_experts - 1) * (2 * self.hidden * self.feedforward)
       p *= self.num_blocks                                     # per each block
       p += (51200 + self.seq_size) * self.hidden               # embeddings
       return p
@@ -57,7 +69,8 @@ class Llm:
     @staticmethod
     def fields():
       return (
-        'num_procs', 'tensor_par', 'pipeline_par', 'data_par', 'tensor_par_net',
+        'num_procs', 'expert_par', 'expert_par_net',
+        'tensor_par', 'pipeline_par', 'data_par', 'tensor_par_net',
         'pipeline_par_net', 'data_par_net', 'batch_size', 'microbatch_size',
         'datatype', 'fused_activation', 'attention_type', 'activation_recompute',
         'pipeline_interleaving', 'optimizer_sharding', 'tensor_par_comm_type',
@@ -70,11 +83,15 @@ class Llm:
       if 'autoregression' not in cfg:
         cfg['autoregression'] = False
         cfg['prefill_size'] = 0
+      if 'expert_par' not in cfg:
+        cfg['expert_par'] = 1
+        cfg['expert_par_net'] = 0
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
 
-    def __init__(self, num_procs, tensor_par, pipeline_par, data_par,
+    def __init__(self, num_procs, expert_par, expert_par_net,
+                 tensor_par, pipeline_par, data_par,
                  tensor_par_net, pipeline_par_net, data_par_net,
                  batch_size, microbatch_size, datatype,
                  fused_activation, attention_type, activation_recompute,
@@ -86,14 +103,18 @@ class Llm:
       self.training = training
       self.num_procs = num_procs
       assert self.num_procs > 0
+      self.expert_par = expert_par
+      self.expert_par_net = expert_par_net
+      assert self.expert_par > 0
       self.tensor_par = tensor_par
       assert self.tensor_par > 0
       self.pipeline_par = pipeline_par
       assert self.pipeline_par > 0
       self.data_par = data_par
       assert self.data_par > 0
-      assert self.num_procs == self.tensor_par * self.pipeline_par * \
-        self.data_par, 'tensor * pipeline * data parallelism != num_procs'
+      assert self.num_procs == self.expert_par * \
+        self.tensor_par * self.pipeline_par * self.data_par, \
+        'expert * tensor * pipeline * data parallelism != num_procs'
       self.tensor_par_net = tensor_par_net
       self.pipeline_par_net = pipeline_par_net
       self.data_par_net = data_par_net
@@ -157,7 +178,8 @@ class Llm:
     def get_json(self):
       keys = Llm.Execution.fields()
       values = [
-        self.num_procs, self.tensor_par, self.pipeline_par, self.data_par, self.tensor_par_net,
+        self.num_procs, self.expert_par, self.expert_par_net,
+        self.tensor_par, self.pipeline_par, self.data_par, self.tensor_par_net,
         self.pipeline_par_net, self.data_par_net, self.global_batch_size, self.microbatch_size,
         self.datatype, self.fused_activation, self.attention_type, self.activation_recompute,
         self.pipeline_interleaving, self.optimizer_sharding, self.tensor_par_comm_type,
@@ -170,6 +192,7 @@ class Llm:
 
     def get_peers_json(self):
       peers = {}
+      # FIXME: add EP
       for di in range(self.data_par):
         for pi in range(self.pipeline_par):
           for ti in range(self.tensor_par):
@@ -226,19 +249,26 @@ class Llm:
         yield cand
 
   @staticmethod
-  def get_all_pipeline_parallelisms(num_procs, tensor_par, num_blocks):
-    assert num_procs % tensor_par == 0
-    max_pp = min(num_procs // tensor_par, num_blocks)
+  def get_all_pipeline_parallelisms(num_procs, tensor_par, num_blocks, expert_par=1):
+    assert num_procs % (tensor_par * expert_par) == 0
+    max_pp = min(num_procs // (tensor_par * expert_par), num_blocks)
     for cand in Llm._factors(max_pp):
-      if (num_procs % (tensor_par * cand) == 0 and
+      if (num_procs % (tensor_par * expert_par * cand) == 0 and
           num_blocks % cand == 0):
         yield cand
 
   @staticmethod
-  def get_data_parallelism(num_procs, tensor_par, pipeline_par):
-    assert num_procs % (tensor_par * pipeline_par) == 0, \
-      f'np={num_procs} tp={tensor_par} pp={pipeline_par}'
-    return num_procs // (tensor_par * pipeline_par)
+  def get_all_expert_parallelisms(num_procs, num_routed_experts):
+    max_ep = min(num_procs, num_routed_experts)
+    for cand in Llm._factors(max_ep):
+      if num_procs % cand == 0 and num_routed_experts % cand == 0:
+        yield cand
+
+  @staticmethod
+  def get_data_parallelism(num_procs, tensor_par, pipeline_par, expert_par=1):
+    assert num_procs % (tensor_par * pipeline_par * expert_par) == 0, \
+      f'np={num_procs} tp={tensor_par} pp={pipeline_par} ep={expert_par}'
+    return num_procs // (tensor_par * pipeline_par * expert_par)
 
   @staticmethod
   def get_valid_pipeline_interleavings(num_blocks, pipeline_par):
@@ -251,12 +281,12 @@ class Llm:
 
   @staticmethod
   def get_valid_microbatch_sizes(
-      seq_size, tensor_par, data_par, global_batch_size, pipeline_par):
+      seq_size, tensor_par, data_par, global_batch_size, pipeline_par, expert_par=1):
     assert global_batch_size % data_par == 0
     local_batch_size = global_batch_size // data_par
     for cand in Llm._factors(local_batch_size):
       batch_seq = cand * seq_size
-      if batch_seq % tensor_par == 0:
+      if batch_seq % (tensor_par * expert_par) == 0:
         yield cand
 
   @staticmethod
@@ -303,6 +333,7 @@ class Llm:
     self._tp_net = None
     self._pp_net = None
     self._dp_net = None
+    self._ep_net = None
 
     # metrics collected after run for each microbatch
     self._block_fw_flops = None
@@ -331,6 +362,8 @@ class Llm:
     self._block_optim_mem_time = None
     self._block_optim_time = None
 
+    self._block_fw_ep_size = None
+    self._block_bw_ep_size = None
     self._baseblock_fw_tp_size = None
     self._edgeblock_fw_tp_size = None
     self._baseblock_agrad_tp_size = None
@@ -415,6 +448,8 @@ class Llm:
     self._optim_time = None
 
     # Top level network stats
+    self._ep_comm_time_exposed = None
+    self._ep_comm_time_link = None
     self._tp_comm_time_exposed = None
     self._tp_comm_time_link = None
     self._recomm_time_exposed = None
@@ -918,6 +953,36 @@ class Llm:
     recompute_flag = self.exe.activation_recompute == "full"
     recompute_ag_flag = recompute_flag or self.exe.seq_par_ag_redo
 
+    if self.app.num_experts > 1:
+      if self.app.num_top_experts < self.app.num_routed_experts:
+        # Gating network: [batch_seq × hidden] → [batch_seq × num_experts]
+        self._llm_block.append(Linear(
+          "MlpBlock_Gate",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.num_routed_experts,
+          needs_recompute=recompute_flag,
+          # With seq_par, we use activations from Comm layers to reflect that
+          # they're split, otherwise we keep full size activations
+          activation_stored=(not recompute_ag_flag)))
+        self._llm_block.append(SoftMax(
+          "MlpBlock_Gate_SoftMax",
+          self.sys,
+          self._batch_seq * self.app.num_routed_experts,
+          needs_recompute=recompute_flag,
+          # With seq_par, we use activations from Comm layers to reflect that
+          # they're split, otherwise we keep full size activations
+          activation_stored=(not recompute_ag_flag)))
+      # FIXME: expert dispatch and gather communication is accounted in _compute_batch_stats.
+      # FIXME: need to consider load inbalance
+      expert_factor = self.app.num_shared_experts + \
+        (self._experts_per_proc - self.app.num_shared_experts) * \
+        self.app.num_top_experts / self.app.num_routed_experts
+      print("kk", expert_factor)
+    else:
+      expert_factor = 1
+
     self._llm_block.append(Fork(
       "MlpBlock_Fork",
       self.sys,
@@ -946,7 +1011,7 @@ class Llm:
         # to be consistent with how much data comm moves/touches
         # This is conservative estimate that does not consider p2p_rs_ag
         # because we don't differentiate between edge and middle blocks here
-        self._activation_size,
+        self._activation_size * expert_factor,
         self.exe.tensor_par_net,
         self.exe.tensor_par,
         tensor_par_comm_type=self.exe.tensor_par_comm_type,
@@ -956,7 +1021,7 @@ class Llm:
       self._llm_block.append(Linear(
         "MlpBlock_Mlp1",
         self.sys,
-        self._batch_seq,
+        self._batch_seq * expert_factor,
         self.app.hidden,
         self.app.feedforward // self.exe.tensor_par,
         needs_recompute=recompute_flag,
@@ -967,7 +1032,7 @@ class Llm:
       self._llm_block.append(LinearOverlapped(
         "MlpBlock_Mlp1_AG",
         self.sys,
-        self._batch_seq,
+        self._batch_seq * expert_factor,
         self.app.hidden,
         self.app.feedforward,
         self.exe.tensor_par_comm_type,
@@ -981,21 +1046,21 @@ class Llm:
     self._llm_block.append(GeLU(
       "MlpBlock_GeLU",
       self.sys,
-      self.app.feedforward * self._batch_seq // self.exe.tensor_par,
+      self.app.feedforward * self._batch_seq * expert_factor // self.exe.tensor_par,
       needs_recompute=recompute_flag,
       fused=self.exe.fused_activation))
     if self.exe.tensor_par_overlap == 'none':
       self._llm_block.append(Linear(
         "MlpBlock_Mlp2",
         self.sys,
-        self._batch_seq,
+        self._batch_seq * expert_factor,
         self.app.feedforward // self.exe.tensor_par,
         self.app.hidden,
         needs_recompute=recompute_flag))
       self._llm_block.append(TPComm(
         "MlpBlock_G",
         self.sys,
-        self._activation_size,
+        self._activation_size * expert_factor,
         self.exe.tensor_par_net,
         self.exe.tensor_par,
         # We only compute flops/mem analyzing this layers, comm analyzed later
@@ -1011,7 +1076,7 @@ class Llm:
       self._llm_block.append(LinearOverlapped(
         "MlpBlock_Mlp2_RS",
         self.sys,
-        self._batch_seq,
+        self._batch_seq * expert_factor,
         self.app.feedforward,
         self.app.hidden,
         self.exe.tensor_par_comm_type,
@@ -1094,6 +1159,13 @@ class Llm:
     self._baseblocks_per_chunk = self._blocks_per_chunk - 1
     self._edgeblocks_per_chunk = 1
 
+    assert self.app.num_routed_experts % self.exe.expert_par == 0, \
+      "EP should evenly devide {self.app.num_routed_experts} experts"
+    self._experts_per_proc = self.app.num_shared_experts + \
+      self.app.num_routed_experts // self.exe.expert_par
+    if self.app.num_experts == 1:
+      assert self._experts_per_proc == 1
+
     # Build model during the compilation step
     self._batch_seq = self.exe.microbatch_size * self.app.seq_size
     self._activation_size = self._batch_seq * self.app.hidden
@@ -1118,6 +1190,11 @@ class Llm:
     assert self.exe.tensor_par_net < self.sys.num_networks
     assert self.exe.pipeline_par_net < self.sys.num_networks
     assert self.exe.data_par_net < self.sys.num_networks
+
+    if self.exe.expert_par > 1:
+      used[self.exe.expert_par_net] = True
+      size[self.exe.expert_par_net] *= self.exe.expert_par
+    self._ep_net = self.sys.get_network(self.exe.expert_par_net)
 
     if self.exe.tensor_par > 1:
       used[self.exe.tensor_par_net] = True
@@ -1541,6 +1618,28 @@ class Llm:
       chunk_fw_pp_time
     pp_bw_comm_time = self.exe._num_microbatches * num_bw_pp_p2ps * \
       chunk_bw_pp_time
+
+    # EP comm time
+    if self.exe.expert_par > 1:
+      # FIXME: need to consider inbalanced distribution
+      self._block_fw_ep_size = self._activation_size * 2 * \
+        self.app.num_activated_experts * ( 1 - 1 / self.exe.expert_par) * \
+        self._bytes_per_element
+      if self.exe.training:
+        self._block_bw_ep_size = self._block_fw_ep_size
+      else:
+        self._block_bw_ep_size = 0
+      block_fw_ep_time = self._ep_net.time('p2p', self._block_fw_ep_size, 2)
+      block_bw_ep_time = self._ep_net.time('p2p', self._block_bw_ep_size, 2)
+    else:
+      block_fw_ep_time = 0
+      block_bw_ep_time = 0
+    ep_fw_comm_time = self.exe._num_microbatches * self._blocks_per_proc * \
+      block_fw_ep_time
+    ep_bw_comm_time = self.exe._num_microbatches * self._blocks_per_proc * \
+      block_bw_ep_time
+    self._ep_comm_time_link = ep_fw_comm_time + ep_bw_comm_time
+    self._ep_comm_time_exposed = self._ep_comm_time_link
 
     # Aggregrates metrics
     self._tp_comm_time_link = tp_fw_comm_time + tp_bw_comm_time
@@ -1978,6 +2077,9 @@ class Llm:
     if self.exe.data_par == 1:
       assert self.get_dp_comm_exposed_time() == 0
       assert self.get_dp_comm_link_time() == 0
+    if self.exe.expert_par == 1:
+      assert self.get_ep_comm_exposed_time() == 0
+      assert self.get_ep_comm_link_time() == 0
 
     assert self._fw_flops >= self._block_fw_flops
     assert self._fw_flops_time >= self._block_fw_flops_time
@@ -2144,6 +2246,12 @@ class Llm:
   def get_pp_comm_link_time(self):
     return self._pp_comm_time_link
 
+  def get_ep_comm_link_time(self):
+    return self._ep_comm_time_link
+
+  def get_ep_comm_exposed_time(self):
+    return self._ep_comm_time_exposed
+
   def get_dp_comm_link_time(self):
     if self.exe.training:
       return self._dp_comm_time_link
@@ -2168,6 +2276,7 @@ class Llm:
     time += self.get_tp_comm_exposed_time()
     time += self.get_pp_comm_exposed_time()
     time += self.get_dp_comm_exposed_time()
+    time += self.get_ep_comm_exposed_time()
     return time
 
   def get_useful_flops(self):
@@ -2367,6 +2476,7 @@ class Llm:
   def display_stats(self):
     stats = "=" * 80 + "\n"
     stats += "" \
+      f"Number of parameters: {human_format(self.app.num_parameters())};\n" \
       f"blocks={self.app.num_blocks}, " \
       f"hidden={self.app.hidden}, feedforward={self.app.feedforward}\n" \
       f"num attn heads: {self.app.attn_heads}, " \
@@ -2399,6 +2509,7 @@ class Llm:
       f"Batch TP comm time on link: {self.get_tp_comm_link_time():.4f};\n" \
       f"Batch PP comm time on link: {self.get_pp_comm_link_time():.4f};\n" \
       f"Batch DP comm time on link: {self.get_dp_comm_link_time():.4f};\n" \
+      f"Batch EP comm time on link: {self.get_ep_comm_link_time():.4f};\n" \
       f"Batch total time: {self.get_total_time():.4f};\n" \
       f"Activation offload required BW: " \
       f"{human_format(self.get_act_offload_bw_req(), 'bandwidth')};\n" \
